@@ -2,15 +2,16 @@ use anyhow::Result;
 use clap::Parser;
 use log::{debug, error, info, warn};
 use nix::poll::{PollFd, PollFlags, poll};
-use photo_plus::db::{Pool, establish_pool};
-use photo_plus::repo::device_repo;
-use photo_plus::logging::init_logging;
-use std::fs;
-use std::os::fd::AsFd;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use photo_plus::{db::establish_pool, logging::init_logging, repo::device_repo::DeviceRepo};
+use std::{
+    fs,
+    os::fd::AsFd,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use udev::{EventType, MonitorBuilder};
 
 #[derive(Debug, Parser)]
@@ -22,177 +23,222 @@ struct Args {
     db_path: PathBuf,
     #[arg(long, default_value_t = 5)]
     scan_interval_secs: u64,
-    #[arg(long, default_value_t = false, help = "Run migrations and exit (for testing/deployment)")]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Run migrations and exit (for testing/deployment)"
+    )]
     migrate_only: bool,
 }
 
-fn now_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+struct Mounter {
+    repo: DeviceRepo,
+    storage_root: PathBuf,
+    scan_interval: Duration,
 }
 
-fn fetch_uuid(devnode: &str) -> Option<String> {
-    // Prefer udev / blkid call
-    let out = Command::new("blkid")
-        .arg("-s")
-        .arg("UUID")
-        .arg("-o")
-        .arg("value")
-        .arg(devnode)
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() {
-            return Some(s);
+impl Mounter {
+    fn new(repo: DeviceRepo, storage_root: PathBuf, scan_interval_secs: u64) -> Self {
+        Self {
+            repo,
+            storage_root,
+            scan_interval: Duration::from_secs(scan_interval_secs),
         }
     }
-    None
-}
 
-fn upsert_add(pool: &Pool, devnode: &str) -> Result<()> {
-    if let Some(uuid) = fetch_uuid(devnode) {
-        device_repo::upsert_device(pool, devnode, &uuid, now_epoch())?;
+    fn now_epoch() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
     }
-    Ok(())
-}
 
-fn mark_removed(pool: &Pool, devnode: &str) -> Result<()> {
-    // Attempt unmount if currently mounted & previously marked success.
-    if is_mounted(devnode) {
-        match Command::new("umount").arg(devnode).status() {
-            Ok(st) if st.success() => info!("unmounted {}", devnode),
-            Ok(_) => warn!("umount command failed for {}", devnode),
-            Err(e) => error!("umount error for {}: {}", devnode, e),
-        }
-    }
-    device_repo::mark_removed(pool, devnode, now_epoch())
-}
-
-fn is_mounted(devnode: &str) -> bool {
-    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-        return mounts.lines().any(|l| l.starts_with(devnode));
-    }
-    false
-}
-
-fn pick_mount_path(storage_root: &Path, uuid: Option<String>) -> Result<PathBuf> {
-    if let Some(u) = uuid {
-        return Ok(storage_root.join(u));
-    }
-    // Fallback: diskN based on current count
-    fs::create_dir_all(storage_root)?;
-    let mut n = 1u32;
-    loop {
-        let p = storage_root.join(format!("disk{}", n));
-        if !p.exists() {
-            return Ok(p);
-        }
-        n += 1;
-    }
-}
-
-fn mount_device(devnode: &str, target: &Path) -> Result<bool> {
-    fs::create_dir_all(target)?;
-    let status = Command::new("mount").arg(devnode).arg(target).status()?;
-    Ok(status.success())
-}
-
-fn process_pending(pool: &Pool, storage_root: &Path) -> Result<()> {
-    let rows = device_repo::list_joined_active(pool)?;
-    for row in rows {
-        let uuid_val = match row.uuid {
-            Some(u) if !u.is_empty() => u,
-            _ => { warn!("device {} missing UUID, skipping", row.devnode); continue; }
-        };
-        if row.mount_success == 1 && is_mounted(&row.devnode) {
-            info!("{} already mounted {}", row.devnode, row.mount_path.as_deref().unwrap_or("?"));
-            continue;
-        }
-        let target = if let Some(mp) = row.mount_path.clone().map(PathBuf::from) { mp } else { pick_mount_path(storage_root, Some(uuid_val.clone()))? };
-        if is_mounted(&row.devnode) {
-            device_repo::mark_mounted_existing(pool, &row.devnode, &target.to_string_lossy(), &uuid_val)?;
-            continue;
-        }
-        match mount_device(&row.devnode, &target) {
-            Ok(true) => {
-                info!("mounted {} at {:?}", row.devnode, target);
-                device_repo::update_mount_result(pool, &row.devnode, &target.to_string_lossy(), &uuid_val)?;
+    fn fetch_uuid(&self, devnode: &str) -> Option<String> {
+        let out = Command::new("blkid")
+            .arg("-s")
+            .arg("UUID")
+            .arg("-o")
+            .arg("value")
+            .arg(devnode)
+            .output()
+            .ok()?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
             }
-            Ok(false) => error!("mount command failed for {}", row.devnode),
-            Err(e) => error!("error mounting {}: {}", row.devnode, e),
+        }
+        None
+    }
+
+    fn is_mounted(&self, devnode: &str) -> bool {
+        if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+            mounts.lines().any(|l| l.starts_with(devnode))
+        } else {
+            false
         }
     }
-    Ok(())
+
+    fn pick_mount_path(&self, uuid: Option<String>) -> Result<PathBuf> {
+        if let Some(u) = uuid {
+            return Ok(self.storage_root.join(u));
+        }
+        fs::create_dir_all(&self.storage_root)?;
+        let mut n = 1u32;
+        loop {
+            let p = self.storage_root.join(format!("disk{}", n));
+            if !p.exists() {
+                return Ok(p);
+            }
+            n += 1;
+        }
+    }
+
+    fn mount_device(&self, devnode: &str, target: &Path) -> Result<bool> {
+        fs::create_dir_all(target)?;
+        Ok(Command::new("mount")
+            .arg(devnode)
+            .arg(target)
+            .status()?
+            .success())
+    }
+
+    fn upsert_add(&self, devnode: &str) -> Result<()> {
+        if let Some(uuid) = self.fetch_uuid(devnode) {
+            self.repo.upsert_device(devnode, &uuid, Self::now_epoch())?;
+        }
+        Ok(())
+    }
+
+    fn mark_removed(&self, devnode: &str) -> Result<()> {
+        if self.is_mounted(devnode) {
+            match Command::new("umount").arg(devnode).status() {
+                Ok(st) if st.success() => info!("unmounted {}", devnode),
+                Ok(_) => warn!("umount command failed for {}", devnode),
+                Err(e) => error!("umount error for {}: {}", devnode, e),
+            }
+        }
+        self.repo.mark_removed(devnode, Self::now_epoch())
+    }
+
+    fn process_pending(&self) -> Result<()> {
+        let rows = self.repo.list_joined_active()?;
+        for row in rows {
+            let uuid_val = match row.uuid {
+                Some(u) if !u.is_empty() => u,
+                _ => {
+                    warn!("device {} missing UUID, skipping", row.devnode);
+                    continue;
+                }
+            };
+            if row.mount_success == 1 && self.is_mounted(&row.devnode) {
+                info!(
+                    "{} already mounted {}",
+                    row.devnode,
+                    row.mount_path.as_deref().unwrap_or("?")
+                );
+                continue;
+            }
+            let target = if let Some(mp) = row.mount_path.clone().map(PathBuf::from) {
+                mp
+            } else {
+                self.pick_mount_path(Some(uuid_val.clone()))?
+            };
+            if self.is_mounted(&row.devnode) {
+                self.repo.mark_mounted_existing(
+                    &row.devnode,
+                    &target.to_string_lossy(),
+                    &uuid_val,
+                )?;
+                continue;
+            }
+            match self.mount_device(&row.devnode, &target) {
+                Ok(true) => {
+                    info!("mounted {} at {:?}", row.devnode, target);
+                    self.repo.update_mount_result(
+                        &row.devnode,
+                        &target.to_string_lossy(),
+                        &uuid_val,
+                    )?;
+                }
+                Ok(false) => error!("mount command failed for {}", row.devnode),
+                Err(e) => error!("error mounting {}: {}", row.devnode, e),
+            }
+        }
+        Ok(())
+    }
+
+    fn start_scheduler(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        thread::spawn(move || {
+            loop {
+                if let Err(e) = this.process_pending() {
+                    error!("process_pending error: {e}");
+                } else {
+                    debug!("scheduled scan complete");
+                }
+                thread::sleep(this.scan_interval);
+            }
+        });
+    }
+
+    fn run_udev_loop(self: &Arc<Self>) -> Result<()> {
+        let monitor = MonitorBuilder::new()?.match_subsystem("block")?.listen()?;
+        let borrowed = monitor.as_fd();
+        let mut fds = [PollFd::new(&borrowed, PollFlags::POLLIN)];
+        loop {
+            if let Err(e) = poll(&mut fds, -1) {
+                error!("poll error: {:?}", e);
+                continue;
+            }
+            for ev in monitor.iter() {
+                if let Some(devnode) = ev.devnode() {
+                    let devpath = devnode.to_string_lossy().to_string();
+                    match ev.event_type() {
+                        EventType::Add => {
+                            if let Err(e) = self.upsert_add(&devpath) {
+                                error!("db upsert error {}: {}", devpath, e);
+                            } else {
+                                info!("device add {} recorded", devpath);
+                            }
+                        }
+                        EventType::Remove => {
+                            if let Err(e) = self.mark_removed(&devpath) {
+                                error!("db remove mark error {}: {}", devpath, e);
+                            } else {
+                                info!("device removed {}", devpath);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
     fs::create_dir_all(&args.storage_root)?;
-
     if let Some(parent) = args.db_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
     let pool = establish_pool(&args.db_path)?;
+    let repo = DeviceRepo::new(pool.clone());
     info!(
         "starting udev monitor + scheduler storage_root={:?} db={:?}",
         args.storage_root, args.db_path
     );
-
     if args.migrate_only {
         info!("migrations applied, exiting due to --migrate-only flag");
-        return Ok(())
+        return Ok(());
     }
-
-    // Spawn scheduler thread
-    let pool_clone = pool.clone();
-    let storage_root_clone = args.storage_root.clone();
-    let interval = args.scan_interval_secs;
-    thread::spawn(move || {
-        loop {
-            if let Err(e) = process_pending(&pool_clone, &storage_root_clone) {
-                error!("process_pending error: {e}");
-            } else {
-                debug!("scheduled scan complete");
-            }
-            thread::sleep(Duration::from_secs(interval));
-        }
-    });
-
-    // udev monitoring (blocking loop)
-    let monitor = MonitorBuilder::new()?.match_subsystem("block")?.listen()?;
-    let borrowed = monitor.as_fd();
-    let mut fds = [PollFd::new(&borrowed, PollFlags::POLLIN)];
-    loop {
-        if let Err(e) = poll(&mut fds, -1) {
-            error!("poll error: {:?}", e);
-            continue;
-        }
-        for ev in monitor.iter() {
-            if let Some(devnode) = ev.devnode() {
-                let devpath = devnode.to_string_lossy().to_string();
-                match ev.event_type() {
-                    EventType::Add => {
-                        if let Err(e) = upsert_add(&pool, &devpath) {
-                            error!("db upsert error {}: {}", devpath, e);
-                        } else {
-                            info!("device add {} recorded", devpath);
-                        }
-                    }
-                    EventType::Remove => {
-                        if let Err(e) = mark_removed(&pool, &devpath) {
-                            error!("db remove mark error {}: {}", devpath, e);
-                        } else {
-                            info!("device removed {}", devpath);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
+    let mounter = Arc::new(Mounter::new(
+        repo,
+        args.storage_root.clone(),
+        args.scan_interval_secs,
+    ));
+    mounter.start_scheduler();
+    mounter.run_udev_loop()
 }
