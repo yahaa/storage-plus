@@ -19,11 +19,8 @@ struct Args {
     storage_root: PathBuf,
     #[arg(long, default_value = "/var/lib/photo-plus/devices.db")]
     db_path: PathBuf,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 5)]
     scan_interval_secs: u64,
-    /// Danger: allow automatic filesystem creation if missing (mkfs.ext4). Leave false to only log.
-    #[arg(long, default_value_t = false)]
-    auto_format: bool,
 }
 
 fn now_epoch() -> i64 {
@@ -34,10 +31,12 @@ fn now_epoch() -> i64 {
 }
 
 fn ensure_db(conn: &Connection) -> Result<()> {
+    // Initial table (older versions) had devnode TEXT UNIQUE. We now upsert by uuid instead,
+    // allowing devnode to change (e.g., /dev/sdb -> /dev/sdc after reordering). We migrate if needed.
     conn.execute_batch(
         r#"CREATE TABLE IF NOT EXISTS devices (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        devnode TEXT UNIQUE NOT NULL,
+        devnode TEXT NOT NULL,
         uuid TEXT,
         removed INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 0,
@@ -46,9 +45,46 @@ fn ensure_db(conn: &Connection) -> Result<()> {
         last_seen INTEGER NOT NULL
     );"#,
     )?;
+
+    // Detect legacy schema with UNIQUE on devnode and migrate.
+    if let Ok(schema) = conn.query_row::<String, _, _>(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'",
+        [],
+        |r| r.get(0),
+    ) {
+        if schema.contains("devnode TEXT UNIQUE") {
+            // Perform migration: recreate table without UNIQUE on devnode.
+            // We keep data; UNIQUE on devnode guaranteed no duplicates so safe copy.
+            conn.execute_batch(
+                r#"BEGIN IMMEDIATE TRANSACTION;
+                CREATE TABLE devices_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    devnode TEXT NOT NULL,
+                    uuid TEXT,
+                    removed INTEGER NOT NULL DEFAULT 0,
+                    joined INTEGER NOT NULL DEFAULT 0,
+                    mount_success INTEGER NOT NULL DEFAULT 0,
+                    mount_path TEXT,
+                    last_seen INTEGER NOT NULL
+                );
+                INSERT INTO devices_new (id, devnode, uuid, removed, joined, mount_success, mount_path, last_seen)
+                    SELECT id, devnode, uuid, removed, joined, mount_success, mount_path, last_seen FROM devices;
+                DROP TABLE devices;
+                ALTER TABLE devices_new RENAME TO devices;
+                COMMIT;"#,
+            )?;
+        }
+    }
+
+    // Ensure a unique index on non-null UUIDs so ON CONFLICT(uuid) works (multiple NULLs allowed).
+    // Previous version used a partial unique index (WHERE uuid IS NOT NULL) which SQLite
+    // cannot target with ON CONFLICT(uuid). Replace it with a full unique index; SQLite
+    // allows multiple NULLs in a UNIQUE index so behavior stays acceptable.
+    conn.execute_batch(
+        r#"DROP INDEX IF EXISTS devices_uuid_unique; CREATE UNIQUE INDEX IF NOT EXISTS devices_uuid_unique ON devices(uuid);"#,
+    )?;
     Ok(())
 }
-
 
 fn fetch_uuid(devnode: &str) -> Option<String> {
     // Prefer udev / blkid call
@@ -71,10 +107,17 @@ fn fetch_uuid(devnode: &str) -> Option<String> {
 
 fn upsert_add(conn: &Connection, devnode: &str) -> Result<()> {
     let uuid = fetch_uuid(devnode);
+    if uuid.is_none() {
+        // Skip insert/update if we couldn't obtain a UUID yet.
+        // Returning Ok so caller can retry later when the device settles.
+        return Ok(());
+    }
+    let uuid_val = uuid.unwrap();
+    // Insert new row or update existing by UUID. We do NOT reset mount_success/mount_path so they persist.
     conn.execute(r#"INSERT INTO devices (devnode, uuid, removed, joined, mount_success, mount_path, last_seen)
         VALUES (?1, ?2, 0, 0, 0, NULL, ?3)
-        ON CONFLICT(devnode) DO UPDATE SET removed=0, last_seen=excluded.last_seen, uuid=COALESCE(excluded.uuid, devices.uuid)"#,
-        params![devnode, uuid, now_epoch()])?;
+        ON CONFLICT(uuid) DO UPDATE SET devnode=excluded.devnode, removed=0, last_seen=excluded.last_seen"#,
+        params![devnode, uuid_val, now_epoch()])?;
     Ok(())
 }
 
@@ -120,31 +163,6 @@ fn is_mounted(devnode: &str) -> bool {
     false
 }
 
-fn ensure_filesystem(devnode: &str, auto_format: bool) -> Result<bool> {
-    // Check if blkid returns a TYPE
-    let out = Command::new("blkid")
-        .arg("-s")
-        .arg("TYPE")
-        .arg("-o")
-        .arg("value")
-        .arg(devnode)
-        .output()?;
-    if out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty() {
-        return Ok(false); // Already has filesystem
-    }
-    if !auto_format {
-        warn!("device {} has no filesystem; auto_format disabled", devnode);
-        return Ok(false);
-    }
-    info!("creating ext4 filesystem on {}", devnode);
-    let status = Command::new("mkfs.ext4").arg("-F").arg(devnode).status()?;
-    if status.success() {
-        Ok(true)
-    } else {
-        Err(anyhow::anyhow!("mkfs.ext4 failed"))
-    }
-}
-
 fn pick_mount_path(storage_root: &Path, uuid: Option<String>) -> Result<PathBuf> {
     if let Some(u) = uuid {
         return Ok(storage_root.join(u));
@@ -167,7 +185,7 @@ fn mount_device(devnode: &str, target: &Path) -> Result<bool> {
     Ok(status.success())
 }
 
-fn process_pending(conn: &Connection, storage_root: &Path, auto_format: bool) -> Result<()> {
+fn process_pending(conn: &Connection, storage_root: &Path) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT devnode, uuid, mount_success, mount_path FROM devices WHERE removed=0 and joined=1",
     )?;
@@ -181,34 +199,48 @@ fn process_pending(conn: &Connection, storage_root: &Path, auto_format: bool) ->
     })?;
     for row in rows.flatten() {
         let (devnode, uuid_opt, mount_success, mount_path_opt) = row;
+        let uuid_val = match uuid_opt {
+            Some(u) if !u.is_empty() => u,
+            _ => {
+                // According to new contract UUID must exist; log and skip if not to avoid inconsistency.
+                warn!("device {} missing UUID in DB, skipping", devnode);
+                continue;
+            }
+        };
         if mount_success == 1 && is_mounted(&devnode) {
+            info!(
+                "{} already mounted {}, skipping",
+                devnode,
+                mount_path_opt.as_deref().unwrap_or("?")
+            );
             continue;
         }
-        // ensure filesystem
-        let _formatted = ensure_filesystem(&devnode, auto_format).unwrap_or_else(|e| {
-            error!("fs ensure failed {}: {}", devnode, e);
-            false
-        });
-        // refresh uuid if missing
-        let uuid_final = uuid_opt.or_else(|| fetch_uuid(&devnode));
+
         let target = if let Some(mp) = mount_path_opt.map(PathBuf::from) {
             mp
         } else {
-            pick_mount_path(storage_root, uuid_final.clone()).unwrap()
+            // UUID guaranteed non-empty -> deterministic path.
+            pick_mount_path(storage_root, Some(uuid_val.clone()))?
         };
+
         if is_mounted(&devnode) {
-            // update DB with path
-            conn.execute("UPDATE devices SET mount_success=1, mount_path=?2, uuid=COALESCE(?3, uuid) WHERE devnode=?1", params![devnode, target.to_string_lossy(), uuid_final])?;
+            // Ensure DB reflects path/uuid.
+            conn.execute(
+                "UPDATE devices SET mount_success=1, mount_path=?2, uuid=?3 WHERE devnode=?1",
+                params![devnode, target.to_string_lossy(), uuid_val],
+            )?;
             continue;
         }
+
         match mount_device(&devnode, &target) {
             Ok(true) => {
                 info!("mounted {} at {:?}", devnode, target);
-                conn.execute("UPDATE devices SET mount_success=1, mount_path=?2, uuid=COALESCE(?3, uuid) WHERE devnode=?1", params![devnode, target.to_string_lossy(), uuid_final])?;
+                conn.execute(
+                    "UPDATE devices SET mount_success=1, mount_path=?2, uuid=?3 WHERE devnode=?1",
+                    params![devnode, target.to_string_lossy(), uuid_val],
+                )?;
             }
-            Ok(false) => {
-                error!("mount command failed for {}", devnode);
-            }
+            Ok(false) => error!("mount command failed for {}", devnode),
             Err(e) => error!("error mounting {}: {}", devnode, e),
         }
     }
@@ -233,7 +265,6 @@ fn main() -> Result<()> {
     let db_path_clone = args.db_path.clone();
     let storage_root_clone = args.storage_root.clone();
     let interval = args.scan_interval_secs;
-    let auto_format = args.auto_format;
     thread::spawn(move || {
         loop {
             match Connection::open(&db_path_clone) {
@@ -241,7 +272,7 @@ fn main() -> Result<()> {
                     if let Err(e) = ensure_db(&c) {
                         error!("ensure_db error: {e}");
                     }
-                    if let Err(e) = process_pending(&c, &storage_root_clone, auto_format) {
+                    if let Err(e) = process_pending(&c, &storage_root_clone) {
                         error!("process_pending error: {e}");
                     } else {
                         debug!("scheduled scan complete");
