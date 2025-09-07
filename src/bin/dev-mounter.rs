@@ -49,6 +49,7 @@ fn ensure_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+
 fn fetch_uuid(devnode: &str) -> Option<String> {
     // Prefer udev / blkid call
     let out = Command::new("blkid")
@@ -80,7 +81,7 @@ fn upsert_add(conn: &Connection, devnode: &str) -> Result<()> {
 fn mark_removed(conn: &Connection, devnode: &str) -> Result<()> {
     // Query existing state to decide if we should attempt umount first.
     if let Ok(mut stmt) =
-        conn.prepare("SELECT mount_path, mount_success FROM devices WHERE devnode=?1")
+        conn.prepare("SELECT mount_path, mount_success FROM devices WHERE devnode=?1 and joined=1")
     {
         if let Ok(mut rows) = stmt.query(params![devnode]) {
             if let Ok(Some(row)) = rows.next() {
@@ -167,8 +168,9 @@ fn mount_device(devnode: &str, target: &Path) -> Result<bool> {
 }
 
 fn process_pending(conn: &Connection, storage_root: &Path, auto_format: bool) -> Result<()> {
-    let mut stmt = conn
-        .prepare("SELECT devnode, uuid, mount_success, mount_path FROM devices WHERE removed=0")?;
+    let mut stmt = conn.prepare(
+        "SELECT devnode, uuid, mount_success, mount_path FROM devices WHERE removed=0 and joined=1",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -263,9 +265,6 @@ fn main() -> Result<()> {
         for ev in monitor.iter() {
             if let Some(devnode) = ev.devnode() {
                 let devpath = devnode.to_string_lossy().to_string();
-                if !devpath.starts_with("/dev/sd") {
-                    continue;
-                }
                 match ev.event_type() {
                     EventType::Add => {
                         let c = Connection::open(&args.db_path).expect("open db");

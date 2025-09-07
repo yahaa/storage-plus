@@ -330,6 +330,7 @@ dependencies = [
  "env_logger",
  "log",
  "nix",
+ "regex",
  "rusqlite",
  "udev",
 ]
