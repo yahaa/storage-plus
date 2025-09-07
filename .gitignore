@@ -1,1 +1,3 @@
 /target
+# Go module cache inadvertently committed; not needed for this Rust crate
+/pkg

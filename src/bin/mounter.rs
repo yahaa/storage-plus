@@ -1,9 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
+use diesel::prelude::*;
 use log::{debug, error, info, warn};
 use nix::poll::{PollFd, PollFlags, poll};
+use photo_plus::db::{Pool, establish_pool};
 use photo_plus::logging::init_logging;
-use rusqlite::{Connection, params};
 use std::fs;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ struct Args {
     db_path: PathBuf,
     #[arg(long, default_value_t = 5)]
     scan_interval_secs: u64,
+    #[arg(long, default_value_t = false, help = "Run migrations and exit (for testing/deployment)")]
+    migrate_only: bool,
 }
 
 fn now_epoch() -> i64 {
@@ -28,62 +31,6 @@ fn now_epoch() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-}
-
-fn ensure_db(conn: &Connection) -> Result<()> {
-    // Initial table (older versions) had devnode TEXT UNIQUE. We now upsert by uuid instead,
-    // allowing devnode to change (e.g., /dev/sdb -> /dev/sdc after reordering). We migrate if needed.
-    conn.execute_batch(
-        r#"CREATE TABLE IF NOT EXISTS devices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        devnode TEXT NOT NULL,
-        uuid TEXT,
-        removed INTEGER NOT NULL DEFAULT 0,
-        joined INTEGER NOT NULL DEFAULT 0,
-        mount_success INTEGER NOT NULL DEFAULT 0,
-        mount_path TEXT,
-        last_seen INTEGER NOT NULL
-    );"#,
-    )?;
-
-    // Detect legacy schema with UNIQUE on devnode and migrate.
-    if let Ok(schema) = conn.query_row::<String, _, _>(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='devices'",
-        [],
-        |r| r.get(0),
-    ) {
-        if schema.contains("devnode TEXT UNIQUE") {
-            // Perform migration: recreate table without UNIQUE on devnode.
-            // We keep data; UNIQUE on devnode guaranteed no duplicates so safe copy.
-            conn.execute_batch(
-                r#"BEGIN IMMEDIATE TRANSACTION;
-                CREATE TABLE devices_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    devnode TEXT NOT NULL,
-                    uuid TEXT,
-                    removed INTEGER NOT NULL DEFAULT 0,
-                    joined INTEGER NOT NULL DEFAULT 0,
-                    mount_success INTEGER NOT NULL DEFAULT 0,
-                    mount_path TEXT,
-                    last_seen INTEGER NOT NULL
-                );
-                INSERT INTO devices_new (id, devnode, uuid, removed, joined, mount_success, mount_path, last_seen)
-                    SELECT id, devnode, uuid, removed, joined, mount_success, mount_path, last_seen FROM devices;
-                DROP TABLE devices;
-                ALTER TABLE devices_new RENAME TO devices;
-                COMMIT;"#,
-            )?;
-        }
-    }
-
-    // Ensure a unique index on non-null UUIDs so ON CONFLICT(uuid) works (multiple NULLs allowed).
-    // Previous version used a partial unique index (WHERE uuid IS NOT NULL) which SQLite
-    // cannot target with ON CONFLICT(uuid). Replace it with a full unique index; SQLite
-    // allows multiple NULLs in a UNIQUE index so behavior stays acceptable.
-    conn.execute_batch(
-        r#"DROP INDEX IF EXISTS devices_uuid_unique; CREATE UNIQUE INDEX IF NOT EXISTS devices_uuid_unique ON devices(uuid);"#,
-    )?;
-    Ok(())
 }
 
 fn fetch_uuid(devnode: &str) -> Option<String> {
@@ -105,54 +52,79 @@ fn fetch_uuid(devnode: &str) -> Option<String> {
     None
 }
 
-fn upsert_add(conn: &Connection, devnode: &str) -> Result<()> {
+fn upsert_add(pool: &Pool, devnode: &str) -> Result<()> {
     let uuid = fetch_uuid(devnode);
     if uuid.is_none() {
         // Skip insert/update if we couldn't obtain a UUID yet.
         // Returning Ok so caller can retry later when the device settles.
         return Ok(());
     }
+
     let uuid_val = uuid.unwrap();
-    // Insert new row or update existing by UUID. We do NOT reset mount_success/mount_path so they persist.
-    conn.execute(r#"INSERT INTO devices (devnode, uuid, removed, joined, mount_success, mount_path, last_seen)
-        VALUES (?1, ?2, 0, 0, 0, NULL, ?3)
-        ON CONFLICT(uuid) DO UPDATE SET devnode=excluded.devnode, removed=0, last_seen=excluded.last_seen"#,
-        params![devnode, uuid_val, now_epoch()])?;
+    use photo_plus::schema::devices;
+    let mut conn = pool.get()?;
+    // emulate upsert
+    conn.immediate_transaction(|c| {
+        // Try update by uuid; if no row updated insert new
+        let updated = diesel::update(devices::table.filter(devices::uuid.eq(&uuid_val)))
+            .set((
+                devices::devnode.eq(devnode),
+                devices::removed.eq(0),
+                devices::last_seen.eq(now_epoch()),
+            ))
+            .execute(c)?;
+        if updated == 0 {
+            diesel::insert_into(devices::table)
+                .values((
+                    devices::devnode.eq(devnode),
+                    devices::uuid.eq(Some(uuid_val.clone())),
+                    devices::removed.eq(0),
+                    devices::joined.eq(0),
+                    devices::mount_success.eq(0),
+                    devices::mount_path.eq::<Option<String>>(None),
+                    devices::last_seen.eq(now_epoch()),
+                ))
+                .execute(c)?;
+        }
+        Ok::<(), diesel::result::Error>(())
+    })?;
     Ok(())
 }
 
-fn mark_removed(conn: &Connection, devnode: &str) -> Result<()> {
+fn mark_removed(pool: &Pool, devnode: &str) -> Result<()> {
     // Query existing state to decide if we should attempt umount first.
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT mount_path, mount_success FROM devices WHERE devnode=?1 and joined=1")
+    use photo_plus::schema::devices;
+    let mut conn = pool.get()?;
+    if let Ok(existing) = devices::table
+        .filter(devices::devnode.eq(devnode))
+        .filter(devices::joined.eq(1))
+        .select((devices::mount_path, devices::mount_success))
+        .first::<(Option<String>, i32)>(&mut conn)
     {
-        if let Ok(mut rows) = stmt.query(params![devnode]) {
-            if let Ok(Some(row)) = rows.next() {
-                let mount_path: Option<String> = row.get(0)?;
-                let mount_success: i64 = row.get(1)?;
-                if mount_success == 1 && is_mounted(devnode) {
-                    // Try to unmount using mount path if present; fallback to devnode.
-                    if let Some(ref mp) = mount_path {
-                        match Command::new("umount").arg(mp).status() {
-                            Ok(st) if st.success() => info!("unmounted {} from {}", devnode, mp),
-                            Ok(_) => warn!("umount command failed for {} (path {})", devnode, mp),
-                            Err(e) => error!("umount error for {} (path {}): {}", devnode, mp, e),
-                        }
-                    } else {
-                        match Command::new("umount").arg(devnode).status() {
-                            Ok(st) if st.success() => info!("unmounted {}", devnode),
-                            Ok(_) => warn!("umount command failed for {}", devnode),
-                            Err(e) => error!("umount error for {}: {}", devnode, e),
-                        }
-                    }
+        let (mount_path, mount_success) = existing;
+        if mount_success == 1 && is_mounted(devnode) {
+            if let Some(mp) = mount_path {
+                match Command::new("umount").arg(&mp).status() {
+                    Ok(st) if st.success() => info!("unmounted {} from {}", devnode, mp),
+                    Ok(_) => warn!("umount command failed for {} (path {})", devnode, mp),
+                    Err(e) => error!("umount error for {} (path {}): {}", devnode, mp, e),
+                }
+            } else {
+                match Command::new("umount").arg(devnode).status() {
+                    Ok(st) if st.success() => info!("unmounted {}", devnode),
+                    Ok(_) => warn!("umount command failed for {}", devnode),
+                    Err(e) => error!("umount error for {}: {}", devnode, e),
                 }
             }
         }
     }
-    conn.execute(
-        "UPDATE devices SET removed=1, mount_success=0, last_seen=?2 WHERE devnode=?1",
-        params![devnode, now_epoch()],
-    )?;
+    diesel::update(devices::table.filter(devices::devnode.eq(devnode)))
+        .set((
+            devices::removed.eq(1),
+            devices::mount_success.eq(0),
+            devices::last_seen.eq(now_epoch()),
+        ))
+        .execute(&mut conn)?;
     Ok(())
 }
 
@@ -185,20 +157,20 @@ fn mount_device(devnode: &str, target: &Path) -> Result<bool> {
     Ok(status.success())
 }
 
-fn process_pending(conn: &Connection, storage_root: &Path) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT devnode, uuid, mount_success, mount_path FROM devices WHERE removed=0 and joined=1",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
+fn process_pending(pool: &Pool, storage_root: &Path) -> Result<()> {
+    use photo_plus::schema::devices;
+    let mut conn = pool.get()?;
+    let rows = devices::table
+        .filter(devices::removed.eq(0))
+        .filter(devices::joined.eq(1))
+        .select((
+            devices::devnode,
+            devices::uuid,
+            devices::mount_success,
+            devices::mount_path,
         ))
-    })?;
-    for row in rows.flatten() {
-        let (devnode, uuid_opt, mount_success, mount_path_opt) = row;
+        .load::<(String, Option<String>, i32, Option<String>)>(&mut conn)?;
+    for (devnode, uuid_opt, mount_success, mount_path_opt) in rows {
         let uuid_val = match uuid_opt {
             Some(u) if !u.is_empty() => u,
             _ => {
@@ -224,21 +196,26 @@ fn process_pending(conn: &Connection, storage_root: &Path) -> Result<()> {
         };
 
         if is_mounted(&devnode) {
-            // Ensure DB reflects path/uuid.
-            conn.execute(
-                "UPDATE devices SET mount_success=1, mount_path=?2, uuid=?3 WHERE devnode=?1",
-                params![devnode, target.to_string_lossy(), uuid_val],
-            )?;
+            diesel::update(devices::table.filter(devices::devnode.eq(&devnode)))
+                .set((
+                    devices::mount_success.eq(1),
+                    devices::mount_path.eq(Some(target.to_string_lossy().to_string())),
+                    devices::uuid.eq(Some(uuid_val.clone())),
+                ))
+                .execute(&mut conn)?;
             continue;
         }
 
         match mount_device(&devnode, &target) {
             Ok(true) => {
                 info!("mounted {} at {:?}", devnode, target);
-                conn.execute(
-                    "UPDATE devices SET mount_success=1, mount_path=?2, uuid=?3 WHERE devnode=?1",
-                    params![devnode, target.to_string_lossy(), uuid_val],
-                )?;
+                diesel::update(devices::table.filter(devices::devnode.eq(&devnode)))
+                    .set((
+                        devices::mount_success.eq(1),
+                        devices::mount_path.eq(Some(target.to_string_lossy().to_string())),
+                        devices::uuid.eq(Some(uuid_val.clone())),
+                    ))
+                    .execute(&mut conn)?;
             }
             Ok(false) => error!("mount command failed for {}", devnode),
             Err(e) => error!("error mounting {}: {}", devnode, e),
@@ -251,34 +228,32 @@ fn main() -> Result<()> {
     init_logging();
     let args = Args::parse();
     fs::create_dir_all(&args.storage_root)?;
+
     if let Some(parent) = args.db_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let conn = Connection::open(&args.db_path)?;
-    ensure_db(&conn)?;
+
+    let pool = establish_pool(&args.db_path)?;
     info!(
         "starting udev monitor + scheduler storage_root={:?} db={:?}",
         args.storage_root, args.db_path
     );
 
+    if args.migrate_only {
+        info!("migrations applied, exiting due to --migrate-only flag");
+        return Ok(())
+    }
+
     // Spawn scheduler thread
-    let db_path_clone = args.db_path.clone();
+    let pool_clone = pool.clone();
     let storage_root_clone = args.storage_root.clone();
     let interval = args.scan_interval_secs;
     thread::spawn(move || {
         loop {
-            match Connection::open(&db_path_clone) {
-                Ok(c) => {
-                    if let Err(e) = ensure_db(&c) {
-                        error!("ensure_db error: {e}");
-                    }
-                    if let Err(e) = process_pending(&c, &storage_root_clone) {
-                        error!("process_pending error: {e}");
-                    } else {
-                        debug!("scheduled scan complete");
-                    }
-                }
-                Err(e) => error!("open db error: {e}"),
+            if let Err(e) = process_pending(&pool_clone, &storage_root_clone) {
+                error!("process_pending error: {e}");
+            } else {
+                debug!("scheduled scan complete");
             }
             thread::sleep(Duration::from_secs(interval));
         }
@@ -298,16 +273,14 @@ fn main() -> Result<()> {
                 let devpath = devnode.to_string_lossy().to_string();
                 match ev.event_type() {
                     EventType::Add => {
-                        let c = Connection::open(&args.db_path).expect("open db");
-                        if let Err(e) = upsert_add(&c, &devpath) {
+                        if let Err(e) = upsert_add(&pool, &devpath) {
                             error!("db upsert error {}: {}", devpath, e);
                         } else {
                             info!("device add {} recorded", devpath);
                         }
                     }
                     EventType::Remove => {
-                        let c = Connection::open(&args.db_path).expect("open db");
-                        if let Err(e) = mark_removed(&c, &devpath) {
+                        if let Err(e) = mark_removed(&pool, &devpath) {
                             error!("db remove mark error {}: {}", devpath, e);
                         } else {
                             info!("device removed {}", devpath);
