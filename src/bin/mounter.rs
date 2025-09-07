@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use diesel::prelude::*;
 use log::{debug, error, info, warn};
 use nix::poll::{PollFd, PollFlags, poll};
 use photo_plus::db::{Pool, establish_pool};
+use photo_plus::repo::device_repo;
 use photo_plus::logging::init_logging;
 use std::fs;
 use std::os::fd::AsFd;
@@ -53,79 +53,22 @@ fn fetch_uuid(devnode: &str) -> Option<String> {
 }
 
 fn upsert_add(pool: &Pool, devnode: &str) -> Result<()> {
-    let uuid = fetch_uuid(devnode);
-    if uuid.is_none() {
-        // Skip insert/update if we couldn't obtain a UUID yet.
-        // Returning Ok so caller can retry later when the device settles.
-        return Ok(());
+    if let Some(uuid) = fetch_uuid(devnode) {
+        device_repo::upsert_device(pool, devnode, &uuid, now_epoch())?;
     }
-
-    let uuid_val = uuid.unwrap();
-    use photo_plus::schema::devices;
-    let mut conn = pool.get()?;
-    // emulate upsert
-    conn.immediate_transaction(|c| {
-        // Try update by uuid; if no row updated insert new
-        let updated = diesel::update(devices::table.filter(devices::uuid.eq(&uuid_val)))
-            .set((
-                devices::devnode.eq(devnode),
-                devices::removed.eq(0),
-                devices::last_seen.eq(now_epoch()),
-            ))
-            .execute(c)?;
-        if updated == 0 {
-            diesel::insert_into(devices::table)
-                .values((
-                    devices::devnode.eq(devnode),
-                    devices::uuid.eq(Some(uuid_val.clone())),
-                    devices::removed.eq(0),
-                    devices::joined.eq(0),
-                    devices::mount_success.eq(0),
-                    devices::mount_path.eq::<Option<String>>(None),
-                    devices::last_seen.eq(now_epoch()),
-                ))
-                .execute(c)?;
-        }
-        Ok::<(), diesel::result::Error>(())
-    })?;
     Ok(())
 }
 
 fn mark_removed(pool: &Pool, devnode: &str) -> Result<()> {
-    // Query existing state to decide if we should attempt umount first.
-    use photo_plus::schema::devices;
-    let mut conn = pool.get()?;
-    if let Ok(existing) = devices::table
-        .filter(devices::devnode.eq(devnode))
-        .filter(devices::joined.eq(1))
-        .select((devices::mount_path, devices::mount_success))
-        .first::<(Option<String>, i32)>(&mut conn)
-    {
-        let (mount_path, mount_success) = existing;
-        if mount_success == 1 && is_mounted(devnode) {
-            if let Some(mp) = mount_path {
-                match Command::new("umount").arg(&mp).status() {
-                    Ok(st) if st.success() => info!("unmounted {} from {}", devnode, mp),
-                    Ok(_) => warn!("umount command failed for {} (path {})", devnode, mp),
-                    Err(e) => error!("umount error for {} (path {}): {}", devnode, mp, e),
-                }
-            } else {
-                match Command::new("umount").arg(devnode).status() {
-                    Ok(st) if st.success() => info!("unmounted {}", devnode),
-                    Ok(_) => warn!("umount command failed for {}", devnode),
-                    Err(e) => error!("umount error for {}: {}", devnode, e),
-                }
-            }
+    // Attempt unmount if currently mounted & previously marked success.
+    if is_mounted(devnode) {
+        match Command::new("umount").arg(devnode).status() {
+            Ok(st) if st.success() => info!("unmounted {}", devnode),
+            Ok(_) => warn!("umount command failed for {}", devnode),
+            Err(e) => error!("umount error for {}: {}", devnode, e),
         }
     }
-    diesel::update(devices::table.filter(devices::devnode.eq(devnode)))
-        .set((
-            devices::removed.eq(1),
-            devices::mount_success.eq(0),
-            devices::last_seen.eq(now_epoch()),
-        ))
-        .execute(&mut conn)?;
-    Ok(())
+    device_repo::mark_removed(pool, devnode, now_epoch())
 }
 
 fn is_mounted(devnode: &str) -> bool {
@@ -158,67 +101,28 @@ fn mount_device(devnode: &str, target: &Path) -> Result<bool> {
 }
 
 fn process_pending(pool: &Pool, storage_root: &Path) -> Result<()> {
-    use photo_plus::schema::devices;
-    let mut conn = pool.get()?;
-    let rows = devices::table
-        .filter(devices::removed.eq(0))
-        .filter(devices::joined.eq(1))
-        .select((
-            devices::devnode,
-            devices::uuid,
-            devices::mount_success,
-            devices::mount_path,
-        ))
-        .load::<(String, Option<String>, i32, Option<String>)>(&mut conn)?;
-    for (devnode, uuid_opt, mount_success, mount_path_opt) in rows {
-        let uuid_val = match uuid_opt {
+    let rows = device_repo::list_joined_active(pool)?;
+    for row in rows {
+        let uuid_val = match row.uuid {
             Some(u) if !u.is_empty() => u,
-            _ => {
-                // According to new contract UUID must exist; log and skip if not to avoid inconsistency.
-                warn!("device {} missing UUID in DB, skipping", devnode);
-                continue;
-            }
+            _ => { warn!("device {} missing UUID, skipping", row.devnode); continue; }
         };
-        if mount_success == 1 && is_mounted(&devnode) {
-            info!(
-                "{} already mounted {}, skipping",
-                devnode,
-                mount_path_opt.as_deref().unwrap_or("?")
-            );
+        if row.mount_success == 1 && is_mounted(&row.devnode) {
+            info!("{} already mounted {}", row.devnode, row.mount_path.as_deref().unwrap_or("?"));
             continue;
         }
-
-        let target = if let Some(mp) = mount_path_opt.map(PathBuf::from) {
-            mp
-        } else {
-            // UUID guaranteed non-empty -> deterministic path.
-            pick_mount_path(storage_root, Some(uuid_val.clone()))?
-        };
-
-        if is_mounted(&devnode) {
-            diesel::update(devices::table.filter(devices::devnode.eq(&devnode)))
-                .set((
-                    devices::mount_success.eq(1),
-                    devices::mount_path.eq(Some(target.to_string_lossy().to_string())),
-                    devices::uuid.eq(Some(uuid_val.clone())),
-                ))
-                .execute(&mut conn)?;
+        let target = if let Some(mp) = row.mount_path.clone().map(PathBuf::from) { mp } else { pick_mount_path(storage_root, Some(uuid_val.clone()))? };
+        if is_mounted(&row.devnode) {
+            device_repo::mark_mounted_existing(pool, &row.devnode, &target.to_string_lossy(), &uuid_val)?;
             continue;
         }
-
-        match mount_device(&devnode, &target) {
+        match mount_device(&row.devnode, &target) {
             Ok(true) => {
-                info!("mounted {} at {:?}", devnode, target);
-                diesel::update(devices::table.filter(devices::devnode.eq(&devnode)))
-                    .set((
-                        devices::mount_success.eq(1),
-                        devices::mount_path.eq(Some(target.to_string_lossy().to_string())),
-                        devices::uuid.eq(Some(uuid_val.clone())),
-                    ))
-                    .execute(&mut conn)?;
+                info!("mounted {} at {:?}", row.devnode, target);
+                device_repo::update_mount_result(pool, &row.devnode, &target.to_string_lossy(), &uuid_val)?;
             }
-            Ok(false) => error!("mount command failed for {}", devnode),
-            Err(e) => error!("error mounting {}: {}", devnode, e),
+            Ok(false) => error!("mount command failed for {}", row.devnode),
+            Err(e) => error!("error mounting {}: {}", row.devnode, e),
         }
     }
     Ok(())
