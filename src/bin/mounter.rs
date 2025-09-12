@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use log::info;
-use photo_plus::{db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::DeviceRepo};
+use photo_plus::{
+    db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::DeviceRepo,
+};
 use std::{fs, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Parser)]

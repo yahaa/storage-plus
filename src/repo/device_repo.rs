@@ -84,13 +84,16 @@ impl DeviceRepo {
 
     pub fn update_mount_result(&self, devnode: &str, mount_path: &str, uuid: &str) -> Result<()> {
         let mut conn = self.conn()?;
-        diesel::update(devices::table.filter(devices::devnode.eq(devnode)))
-            .set((
-                devices::mount_success.eq(1),
-                devices::mount_path.eq(Some(mount_path.to_string())),
-                devices::uuid.eq(Some(uuid.to_string())),
-            ))
-            .execute(&mut conn)?;
+        diesel::update(
+            devices::table
+                .filter(devices::devnode.eq(devnode))
+                .filter(devices::uuid.eq(uuid)),
+        )
+        .set((
+            devices::mount_success.eq(1),
+            devices::mount_path.eq(Some(mount_path.to_string())),
+        ))
+        .execute(&mut conn)?;
         Ok(())
     }
 
