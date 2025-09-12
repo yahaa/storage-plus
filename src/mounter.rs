@@ -88,7 +88,7 @@ impl Mounter {
             .success())
     }
 
-    fn upsert_add(&self, devnode: &str) -> Result<()> {
+    fn upsert_device(&self, devnode: &str) -> Result<()> {
         if let Some(uuid) = self.fetch_uuid(devnode) {
             self.repo
                 .upsert_device(devnode, &uuid, Self::now_epoch())?;
@@ -182,7 +182,7 @@ impl Mounter {
                     let devpath = devnode.to_string_lossy().to_string();
                     match ev.event_type() {
                         EventType::Add => {
-                            if let Err(e) = self.upsert_add(&devpath) {
+                            if let Err(e) = self.upsert_device(&devpath) {
                                 error!("db upsert error {}: {}", devpath, e);
                             } else {
                                 info!("device add {} recorded", devpath);
