@@ -16,3 +16,16 @@ diesel::table! {
         last_seen -> BigInt,
     }
 }
+
+diesel::table! {
+    files (id) {
+        id -> Integer,
+        key -> Text,
+        filename -> Text,
+        content_type -> Nullable<Text>,
+        size -> BigInt,
+        path -> Text,
+        created_at -> BigInt,
+        deleted -> Integer,
+    }
+}

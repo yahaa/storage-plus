@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use log::info;
-use photo_plus::{
+use storage_plus::{
     db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::DeviceRepo,
 };
 use std::{fs, path::PathBuf, sync::Arc};
@@ -11,7 +11,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 struct Args {
     #[arg(long, default_value = "/mnt/storage_pool")]
     storage_root: PathBuf,
-    #[arg(long, default_value = "/var/lib/photo-plus/devices.db")]
+    #[arg(long, default_value = "/var/lib/storage-plus/storage-plus.db")]
     db_path: PathBuf,
     #[arg(long, default_value_t = 5)]
     scan_interval_secs: u64,

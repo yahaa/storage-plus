@@ -25,9 +25,3 @@ pub struct NewDevice<'a> {
     pub mount_path: Option<&'a str>,
     pub last_seen: i64,
 }
-
-impl<'a> NewDevice<'a> {
-    pub fn new(devnode: &'a str, uuid: Option<&'a str>, ts: i64) -> Self {
-        Self { devnode, uuid, removed: 0, joined: 0, mount_success: 0, mount_path: None, last_seen: ts }
-    }
-}

@@ -1,0 +1,59 @@
+use anyhow::Result;
+use diesel::prelude::*;
+
+use crate::{
+    db::Pool,
+    entity::file_meta::{FileMeta, NewFileMeta},
+    schema::files,
+};
+
+pub struct FileRepo {
+    pool: Pool,
+}
+
+impl FileRepo {
+    pub fn new(pool: Pool) -> Self { Self { pool } }
+
+    fn conn(&self) -> Result<r2d2::PooledConnection<diesel::r2d2::ConnectionManager<SqliteConnection>>> { Ok(self.pool.get()?) }
+
+    pub fn insert_file(
+        &self,
+        key: &str,
+        filename: &str,
+        content_type: Option<&str>,
+        size: i64,
+        path: &str,
+        created_at: i64,
+    ) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let new_row = NewFileMeta {
+            key,
+            filename,
+            content_type,
+            size,
+            path,
+            created_at,
+            deleted: 0,
+        };
+        Ok(diesel::insert_into(files::table)
+            .values(&new_row)
+            .execute(&mut conn)?)
+    }
+
+    pub fn get_by_key(&self, key: &str) -> Result<Option<FileMeta>> {
+        let mut conn = self.conn()?;
+        let res = files::table
+            .filter(files::key.eq(key))
+            .filter(files::deleted.eq(0))
+            .first::<FileMeta>(&mut conn)
+            .optional()?;
+        Ok(res)
+    }
+
+    pub fn mark_deleted(&self, key: &str) -> Result<usize> {
+        let mut conn = self.conn()?;
+        Ok(diesel::update(files::table.filter(files::key.eq(key)))
+            .set(files::deleted.eq(1))
+            .execute(&mut conn)?)
+    }
+}
