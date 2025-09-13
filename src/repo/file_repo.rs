@@ -12,9 +12,15 @@ pub struct FileRepo {
 }
 
 impl FileRepo {
-    pub fn new(pool: Pool) -> Self { Self { pool } }
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
 
-    fn conn(&self) -> Result<r2d2::PooledConnection<diesel::r2d2::ConnectionManager<SqliteConnection>>> { Ok(self.pool.get()?) }
+    fn conn(
+        &self,
+    ) -> Result<r2d2::PooledConnection<diesel::r2d2::ConnectionManager<SqliteConnection>>> {
+        Ok(self.pool.get()?)
+    }
 
     pub fn insert_file(
         &self,

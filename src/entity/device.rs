@@ -1,5 +1,5 @@
-use diesel::prelude::*;
 use crate::schema::devices;
+use diesel::prelude::*;
 
 #[derive(Debug, Queryable, Identifiable)]
 #[diesel(table_name = devices)]

@@ -1,5 +1,5 @@
-use diesel::prelude::*;
 use crate::schema::files;
+use diesel::prelude::*;
 
 #[derive(Debug, Queryable, Identifiable)]
 #[diesel(table_name = files)]

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use diesel::prelude::*;
 use diesel::r2d2::{self, ConnectionManager};
-use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use std::path::Path;
 
 // 使用嵌入式 migrations，避免运行时查找当前工作目录导致的找不到 migrations 目录问题。

@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use nix::poll::{poll, PollFd, PollFlags};
+use nix::poll::{PollFd, PollFlags, poll};
 use udev::{EventType, MonitorBuilder};
 
 use crate::repo::device_repo::DeviceRepo;
@@ -90,8 +90,7 @@ impl Mounter {
 
     fn upsert_device(&self, devnode: &str) -> Result<()> {
         if let Some(uuid) = self.fetch_uuid(devnode) {
-            self.repo
-                .upsert_device(devnode, &uuid, Self::now_epoch())?;
+            self.repo.upsert_device(devnode, &uuid, Self::now_epoch())?;
         }
         Ok(())
     }
@@ -157,13 +156,15 @@ impl Mounter {
     /// Spawn background thread for periodic reconciliation.
     pub fn start_scheduler(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        thread::spawn(move || loop {
-            if let Err(e) = this.process_pending() {
-                error!("process_pending error: {e}");
-            } else {
-                debug!("scheduled scan complete");
+        thread::spawn(move || {
+            loop {
+                if let Err(e) = this.process_pending() {
+                    error!("process_pending error: {e}");
+                } else {
+                    debug!("scheduled scan complete");
+                }
+                thread::sleep(this.scan_interval);
             }
-            thread::sleep(this.scan_interval);
         });
     }
 

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use log::info;
+use std::{fs, path::PathBuf, sync::Arc};
 use storage_plus::{
     db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::DeviceRepo,
 };
-use std::{fs, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Udev device manager with SQLite tracking", long_about = None)]
