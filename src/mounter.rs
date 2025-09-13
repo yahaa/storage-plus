@@ -17,15 +17,18 @@ use crate::repo::device_repo::DeviceRepo;
 
 /// Orchestrates device tracking, mounting, and periodic reconciliation.
 pub struct Mounter {
-    repo: DeviceRepo,
+    repo: Arc<dyn DeviceRepo>,
     storage_root: PathBuf,
     scan_interval: Duration,
 }
 
 impl Mounter {
-    pub fn new(repo: DeviceRepo, storage_root: PathBuf, scan_interval_secs: u64) -> Self {
+    pub fn new<R>(repo: R, storage_root: PathBuf, scan_interval_secs: u64) -> Self
+    where
+        R: DeviceRepo + 'static,
+    {
         Self {
-            repo,
+            repo: Arc::new(repo),
             storage_root,
             scan_interval: Duration::from_secs(scan_interval_secs),
         }

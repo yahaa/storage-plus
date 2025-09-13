@@ -3,7 +3,7 @@ use clap::Parser;
 use log::info;
 use std::{fs, path::PathBuf, sync::Arc};
 use storage_plus::{
-    db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::DeviceRepo,
+    db::establish_pool, logging::init_logging, mounter::Mounter, repo::device_repo::new_device_repo,
 };
 
 #[derive(Debug, Parser)]
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let pool = establish_pool(&args.db_path)?;
-    let repo = DeviceRepo::new(pool.clone());
+    let repo = new_device_repo(pool.clone());
     info!(
         "starting udev monitor + scheduler storage_root={:?} db={:?}",
         args.storage_root, args.db_path
