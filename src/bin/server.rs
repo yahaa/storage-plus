@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let pool = establish_pool(&args.db_path)?;
-    let repo = new_file_repo(pool.clone());
+    let file_repo = new_file_repo(pool.clone());
     let device_repo = new_device_repo(pool);
 
     if args.migrate_only {
@@ -52,5 +52,5 @@ async fn main() -> Result<()> {
         addr: args.addr.clone(),
         device_cache_ttl_secs: args.device_cache_ttl_secs,
     };
-    server::run(cfg, repo, device_repo).await
+    server::run(cfg, file_repo, device_repo).await
 }

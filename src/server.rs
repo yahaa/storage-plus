@@ -29,7 +29,7 @@ struct AppState {
 
 #[derive(Debug)]
 struct DeviceUuidCache {
-    inner: RwLock<Option<(String, Instant)>>,
+    inner: RwLock<Option<(Vec<String>, Instant)>>,
     ttl: Duration,
 }
 
@@ -39,6 +39,54 @@ impl DeviceUuidCache {
             inner: RwLock::new(None),
             ttl,
         }
+    }
+
+    // Get cached device UUID if fresh; otherwise fetch via repo and update cache
+    async fn get_or_fetch(&self, repo: Arc<dyn DeviceRepo>) -> actix_web::Result<String> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as usize;
+        // Read cache snapshot
+        if let Some((uuids, ts)) = { self.inner.read().await.clone() } {
+            if ts.elapsed() < self.ttl {
+                if uuids.is_empty() {
+                    return Err(actix_web::error::ErrorServiceUnavailable(
+                        "no active device uuid",
+                    ));
+                }
+
+                let idx = nanos % uuids.len();
+                return Ok(uuids[idx].clone());
+            }
+        }
+
+        // Fetch from DB (blocking). Consider multiple devices: pick one at random among mounted.
+        let rows = web::block(move || repo.list_joined_active())
+            .await
+            .map_err(|e| {
+                actix_web::error::ErrorServiceUnavailable(format!("device uuid error: {e}"))
+            })?
+            .map_err(|e| {
+                actix_web::error::ErrorServiceUnavailable(format!("device uuid error: {e}"))
+            })?;
+        let candidates: Vec<String> = rows
+            .into_iter()
+            .filter(|r| r.mount_success == 1)
+            .filter_map(|r| r.uuid)
+            .collect();
+        {
+            let mut w = self.inner.write().await;
+            *w = Some((candidates.clone(), Instant::now()));
+        }
+        if candidates.is_empty() {
+            return Err(actix_web::error::ErrorServiceUnavailable(
+                "no active device uuid",
+            ));
+        }
+        // Pseudo-random selection using current time nanos to avoid extra deps
+        let idx = nanos % candidates.len();
+        Ok(candidates[idx].clone())
     }
 }
 
@@ -65,55 +113,10 @@ async fn upload(
         let key = Uuid::new_v4().to_string();
         // device uuid: prefer cached value; if absent, query once and cache
         info!("uploading file: {}", orig_name);
-        let device_uuid = {
-            let repo = data.device_repo.clone();
-            let cache = data.device_cache.clone();
-            // Clone cached value, then drop read lock before possibly taking a write lock
-            let cached = { cache.inner.read().await.clone() };
-            if let Some((uuid, ts)) = cached {
-                if ts.elapsed() < cache.ttl {
-                    uuid
-                } else {
-                    let uuid_opt = web::block(move || repo.get_active_uuid())
-                        .await
-                        .map_err(|e| {
-                            actix_web::error::ErrorServiceUnavailable(format!(
-                                "device uuid error: {e}"
-                            ))
-                        })?
-                        .map_err(|e| {
-                            actix_web::error::ErrorServiceUnavailable(format!(
-                                "device uuid error: {e}"
-                            ))
-                        })?;
-                    let uuid = uuid_opt.ok_or_else(|| {
-                        actix_web::error::ErrorServiceUnavailable("no active device uuid")
-                    })?;
-                    {
-                        let mut w = cache.inner.write().await;
-                        *w = Some((uuid.clone(), Instant::now()));
-                    }
-                    uuid
-                }
-            } else {
-                let uuid_opt = web::block(move || repo.get_active_uuid())
-                    .await
-                    .map_err(|e| {
-                        actix_web::error::ErrorServiceUnavailable(format!("device uuid error: {e}"))
-                    })?
-                    .map_err(|e| {
-                        actix_web::error::ErrorServiceUnavailable(format!("device uuid error: {e}"))
-                    })?;
-                let uuid = uuid_opt.ok_or_else(|| {
-                    actix_web::error::ErrorServiceUnavailable("no active device uuid")
-                })?;
-                {
-                    let mut w = cache.inner.write().await;
-                    *w = Some((uuid.clone(), Instant::now()));
-                }
-                uuid
-            }
-        };
+        let device_uuid = data
+            .device_cache
+            .get_or_fetch(data.device_repo.clone())
+            .await?;
         // log the device uuid being used
         info!("Using device UUID: {}", device_uuid);
 

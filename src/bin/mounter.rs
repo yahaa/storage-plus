@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let pool = establish_pool(&args.db_path)?;
-    let repo = new_device_repo(pool.clone());
+    let device_repo = new_device_repo(pool.clone());
     info!(
         "starting udev monitor + scheduler storage_root={:?} db={:?}",
         args.storage_root, args.db_path
@@ -41,7 +41,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mounter = Arc::new(Mounter::new(
-        repo,
+        device_repo,
         args.storage_root.clone(),
         args.scan_interval_secs,
     ));
