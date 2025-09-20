@@ -189,9 +189,8 @@ async fn download(
     data: web::Data<AppState>,
 ) -> actix_web::Result<NamedFile> {
     let key = path.into_inner();
-    let key_db = key.clone();
     let repo = data.file_repo.clone();
-    let meta_res = web::block(move || repo.get_by_key(&key_db))
+    let meta_res = web::block(move || repo.get_by_key(&key))
         .await
         .map_err(|e| {
             error!("get_by_key error: {e:?}");
